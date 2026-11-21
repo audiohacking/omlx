@@ -1616,6 +1616,43 @@ def test_a_helper_daemon_moves_to_a_faster_wired_link(monkeypatch):
     assert agent._fastest_link(lan) is lan
 
 
+def test_a_helper_daemon_uses_a_thunderbolt_bridge_without_a_media_speed(
+    monkeypatch,
+):
+    lan = agent.AgentTarget(
+        "gpu", "gpu-box", "192.168.1.230", "ethernet", 8851, _KEY, speed_mbps=1000
+    )
+    links = [
+        {"ipv4": ["192.168.1.230/24"], "link_local": "fe80::1", "mbps": 1000},
+        {"ipv4": [], "link_local": "fe80::2", "mbps": 80000},
+    ]
+    # The member port has no route to the peer. The bridge does, and macOS
+    # reports no negotiated speed for either.
+    ports = SimpleNamespace(
+        media_speeds={"en0": 1000},
+        thunderbolt_interfaces=frozenset({"en7"}),
+        wifi_interfaces=frozenset({"en1"}),
+        link_local_addresses={"bridge0": "fe80::mac", "en1": "fe80::wifi"},
+    )
+    tried = []
+
+    def connect(target, timeout):
+        tried.append(target.address)
+        if target.address != "fe80::2%bridge0":
+            raise launcher.LaunchError("no route")
+        return SimpleNamespace(close=lambda: None)
+
+    monkeypatch.setattr(agent, "remote_info", lambda target: {"links": links})
+    monkeypatch.setattr(agent, "probe_host_interfaces", lambda host: ports)
+    monkeypatch.setattr(agent, "_local_link", lambda address: ("ethernet", 1000))
+    monkeypatch.setattr(agent, "_connect", connect)
+
+    moved = agent._fastest_link(lan)
+
+    assert (moved.address, moved.speed_mbps) == ("fe80::2%bridge0", 80000)
+    assert tried == ["fe80::2%bridge0"]
+
+
 def test_helper_daemon_checks_and_layers_over_two_gpus(monkeypatch, caplog):
     # The first GPU also holds the shared tensors; each keeps 8 GiB spare.
     gib = 1 << 30

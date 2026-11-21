@@ -184,6 +184,28 @@ def _routed_ipv4(link: dict[str, Any]) -> list[str]:
     return [a for a in addresses if ipaddress.ip_address(a) not in _SELF_ASSIGNED]
 
 
+def _cable_interfaces(host: Any) -> list[tuple[str, int | None]]:
+    """Local ports that can face a direct cable, with their media speed.
+
+    ``ifconfig`` gives a speed for Ethernet. A Thunderbolt bridge often says
+    only ``autoselect`` and holds the IPv6 link-local on the bridge, not on
+    the member port, so those ports are included with no speed of their own.
+    """
+
+    media = getattr(host, "media_speeds", {}) or {}
+    thunderbolt = set(getattr(host, "thunderbolt_interfaces", ()) or ())
+    wifi = set(getattr(host, "wifi_interfaces", ()) or ())
+    link_local = getattr(host, "link_local_addresses", {}) or {}
+    found = [(name, speed) for name, speed in media.items() if name not in wifi]
+    seen = {name for name, _ in found}
+    for name in link_local:
+        if name in seen or name in wifi:
+            continue
+        if name in thunderbolt or name.startswith("bridge"):
+            found.append((name, None))
+    return found
+
+
 def _fastest_link(target: AgentTarget) -> AgentTarget:
     """*target* moved to a faster wired link the helper reports, if one answers.
 
@@ -200,9 +222,9 @@ def _fastest_link(target: AgentTarget) -> AgentTarget:
         link for link, addresses in routed if link.get("link_local") and not addresses
     ]
     try:
-        ports = probe_host_interfaces("localhost").media_speeds if cables else {}
+        host = probe_host_interfaces("localhost") if cables else None
     except (OSError, RuntimeError):
-        ports = {}
+        host = None
     current = target.speed_mbps
     candidates = []
     for link, addresses in routed:
@@ -213,10 +235,13 @@ def _fastest_link(target: AgentTarget) -> AgentTarget:
             kind, speed = _local_link(address)
             if kind != "wifi" and address != target.address:
                 candidates.append((_slower(speed, helper_speed), address))
-        if link in cables:
-            for interface, speed in ports.items():
+        if link in cables and host is not None:
+            for interface, speed in _cable_interfaces(host):
+                # A Thunderbolt bridge often has no "1000baseT"-style media
+                # line. The helper's own speed is what ranks that cable.
+                ranked = _slower(speed, helper_speed) if speed else helper_speed
                 address = f"{link['link_local']}%{interface}"
-                candidates.append((_slower(speed, helper_speed), address))
+                candidates.append((ranked, address))
     for speed, address in sorted(candidates, key=lambda c: -(c[0] or 0)):
         if not speed or speed <= (current or 0):
             break
