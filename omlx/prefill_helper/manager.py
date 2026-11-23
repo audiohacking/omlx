@@ -169,7 +169,7 @@ def held_layers(
 ) -> int:
     """Layers the helper holds: as many as fit, or the fixed number."""
     shared, per_layer = adapter.memory_plan(model_path)
-    limit = adapter.split_limit(len(per_layer))
+    limit = adapter.split_limit(len(per_layer), model_path)
     held = fit_layers(
         shared, per_layer, helper_budget(info), limit, helper_reserve(info)
     )

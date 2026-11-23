@@ -1718,7 +1718,7 @@ def test_helper_daemon_checks_and_layers_over_two_gpus(monkeypatch, caplog):
 def test_a_helper_daemon_is_planned_with_the_room_it_keeps(monkeypatch):
     gib = 1 << 30
     adapter = SimpleNamespace(
-        memory_plan=lambda path: (2 * gib, [gib] * 40), split_limit=lambda n: n - 1
+        memory_plan=lambda path: (2 * gib, [gib] * 40), split_limit=lambda n, model_path=None: n - 1
     )
     info = {"budgets": [24 * gib], "reserve": 6 * gib}
     daemon = SimpleNamespace(
@@ -2088,6 +2088,36 @@ def _inkling2_state(cache):
         else:
             out += [a for a in item.cache if a is not None]
     return [np.asarray(a) for a in out]
+
+
+def _inkling2_loop():
+    """A looped Inkling 2 stack: prelude 0-5, core 6-11 run three times, tail
+    12-17 (30 layer visits). Full attention at 5, 11 and 17."""
+    lm = _inkling2_tiny(
+        formats=("nvfp4",) * 12 + ("mxfp8",) * 6,
+        loop_config={"core_start": 6, "core_end": 12, "num_passes": 3, "gate_rank": 4},
+    )
+    mx.eval(lm.parameters())
+    return lm
+
+
+@pytest.mark.parametrize(
+    "k,prefix", [(1, 0), (5, 0), (6, 0), (7, 0), (11, 0), (12, 0), (7, 1), (12, 1)]
+)
+def test_inkling2_loop_split_matches_whole_model(k, prefix):
+    # Cuts in the prelude, at the core, inside and at the end of the first
+    # pass: this Mac runs the later passes and the tail from the cut.
+    ids = mx.array(np.random.default_rng(5).integers(3, 58, (1, 30)))
+    _split_matches(INKLING2, _inkling2_loop, ids, [12, 10, 8], k, prefix, _inkling2_state)
+
+
+def test_inkling2_loop_split_limit_ends_the_first_pass(tmp_path):
+    config = {"model_type": "inkling2_loop", "text_config": {"loop_config": {
+        "core_start": 6, "core_end": 18, "num_passes": 3}}}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    assert INKLING2.split_limit(24, tmp_path) == 18
+    assert INKLING2.split_limit(24) == 23
+    assert INKLING2.layer_count(_inkling2_loop()) == 30
 
 
 @pytest.mark.parametrize("k,prefix", [(1, 0), (5, 0), (6, 0), (7, 0), (11, 0), (7, 1)])

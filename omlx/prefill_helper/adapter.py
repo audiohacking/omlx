@@ -96,8 +96,11 @@ class StageAdapter:
     def layer_count(self, lm: Any) -> int:
         raise NotImplementedError
 
-    def split_limit(self, n_layers: int) -> int:
-        """Largest ``k`` this family supports; the helper holds ``[0, k)``."""
+    def split_limit(self, n_layers: int, model_path: str | Path | None = None) -> int:
+        """Largest ``k`` this family supports; the helper holds ``[0, k)``.
+
+        ``model_path`` lets a family read a limit from the checkpoint.
+        """
         return n_layers - 1
 
     def keep_first(self, lm: Any, k: int) -> None:

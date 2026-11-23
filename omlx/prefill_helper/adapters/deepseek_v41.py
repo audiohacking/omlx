@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
@@ -88,7 +89,7 @@ class DeepseekV41Adapter(StageAdapter):
     def layer_count(self, lm: Any) -> int:
         return lm._config.n_layers
 
-    def split_limit(self, n_layers: int) -> int:
+    def split_limit(self, n_layers: int, model_path: str | Path | None = None) -> int:
         # The CED midpoint holds the decoder replay input, so it stays here.
         return n_layers // 2
 

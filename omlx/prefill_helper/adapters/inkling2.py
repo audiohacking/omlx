@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Inkling 2 (inkling2): split at any layer.
+"""Inkling 2 (inkling2, inkling2_loop): split at any layer, or any layer visit.
 
 The layers exchange a partial block sum and the completed attention-residual
 blocks. The cut sends the partial sum ``h`` entering layer ``k`` and, as
@@ -7,10 +7,19 @@ blocks. The cut sends the partial sum ``h`` entering layer ``k`` and, as
 ``k``; each side normalizes those itself, as the boundary layer does. A
 layer's state is the K/V rows the chunk appended and its four conv windows;
 a sliding layer keeps only the rows its window can still reach.
+
+A looped checkpoint (inkling2_loop) runs its core layers several times per
+token, and every visit owns a cache entry, so the split counts visits. The
+helper takes visits up to the end of the first core pass, which reads no
+messages: up to there visit ``i`` is layer ``i``, and the cut carries what
+a plain one does. This Mac continues the loop from the cut: the later passes
+restart from the partial sum entering the core, which the cut already sends
+as ``blk.<core_start>``.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -37,6 +46,24 @@ _CONV_SLOTS = 4
 
 def _layers(lm: Any) -> list:
     return lm.model.layers
+
+
+def _loop_end(model_path: str | Path | None) -> int | None:
+    """The visit that ends a looped checkpoint's first core pass, or None."""
+    if model_path is None:
+        return None
+    try:
+        config = json.loads((Path(model_path).expanduser() / "config.json").read_text())
+    except (OSError, ValueError):
+        return None
+    loop = (config.get("text_config") or config).get("loop_config")
+    return int(loop["core_end"]) if loop else None
+
+
+def _keep_visits(model: Any, k: int) -> None:
+    """A looped model that keeps only its first ``k`` layers runs them once."""
+    if getattr(model, "_core_start", None) is not None:
+        model._schedule = tuple(model._schedule[:k])
 
 
 def _local_name(tensor: str) -> str:
@@ -86,6 +113,50 @@ def _run_layers(
     return h, entered
 
 
+def _run_visits(
+    model: Any,
+    h: mx.array,
+    blocks: list,
+    boundary: Arrays,
+    below: list[int],
+    visits: list,
+    k: int,
+    capture: Capture | None = None,
+) -> tuple[mx.array, list]:
+    """A looped model's visits from ``k`` on, as ``Inkling2TextModel`` runs
+    them. A cut inside the first core pass rebuilds the prelude the later
+    passes restart from: the partial sum entering the core and the blocks
+    completed before it."""
+    core = model._core_start
+    prelude = None
+    if k > core:
+        prelude = (
+            boundary[f"blk.{core}"],
+            [_unit_rms(boundary[f"blk.{i}"]) for i in below if i < core],
+        )
+    bank = tau = None
+    for visit in range(k, len(model._schedule)):
+        idx, loop_pass = model._schedule[visit]
+        layer, c = model.layers[idx], visits[visit]
+        if idx == core and prelude is None:
+            prelude = (h, list(blocks))
+        elif idx == core:
+            bank = (blocks[len(prelude[1]) + 1 :], inkling2._unit_rms(h.astype(mx.float32)))
+            h, blocks = prelude[0], list(prelude[1])
+        if capture is not None:
+            capture.take(visit, h)
+        if not layer.sliding and tau is None:
+            tau = layer.attn.log_tau(c[0], h.shape[1])
+        h = layer(
+            h,
+            blocks,
+            cache=c,
+            bank=bank if loop_pass else None,
+            tau=None if layer.sliding else tau,
+        )
+    return h, blocks
+
+
 def _cache_state(i: int, visit: tuple, rows: int | None) -> Arrays:
     """Layer ``i``'s conv windows and its ``rows`` newest K/V rows (all it
     holds when None)."""
@@ -109,7 +180,7 @@ def _cache_state(i: int, visit: tuple, rows: int | None) -> Arrays:
 
 
 class Inkling2Adapter(StageAdapter):
-    model_types = ("inkling2",)
+    model_types = ("inkling2", "inkling2_loop")
     contract = 1
     captures_layers = True
 
@@ -118,7 +189,12 @@ class Inkling2Adapter(StageAdapter):
         return engine_type == "vlm"
 
     def layer_count(self, lm: Any) -> int:
-        return len(_layers(lm))
+        # A looped model's split and its cost count layer visits.
+        return lm.model.num_visits
+
+    def split_limit(self, n_layers: int, model_path: str | Path | None = None) -> int:
+        end = _loop_end(model_path)
+        return n_layers - 1 if end is None else min(n_layers - 1, end)
 
     def resident(self, tensor: str) -> bool:
         # The embedding and the layers; the head, the final mix and norm,
@@ -127,6 +203,7 @@ class Inkling2Adapter(StageAdapter):
 
     def keep_first(self, lm: Any, k: int) -> None:
         lm.model.layers = _layers(lm)[:k]
+        _keep_visits(lm.model, k)
         for name in ("lm_head", "vision_tower"):
             if name in lm:
                 del lm[name]
@@ -136,12 +213,15 @@ class Inkling2Adapter(StageAdapter):
 
     @contextmanager
     def use_first(self, lm: Any, k: int):
-        layers = _layers(lm)
+        layers, schedule = _layers(lm), getattr(lm.model, "_schedule", None)
         lm.model.layers = layers[:k]
+        _keep_visits(lm.model, k)
         try:
             yield
         finally:
             lm.model.layers = layers
+            if schedule is not None:
+                lm.model._schedule = schedule
 
     def load_first(self, path: str, k: int, a8_min_tokens: int | None = None) -> Any:
         maybe_apply_pre_load_patches(path, None, for_vlm=True)
@@ -213,19 +293,24 @@ class Inkling2Adapter(StageAdapter):
         capture: Capture | None = None,
         **kwargs: Any,
     ) -> Any:
-        layers = _layers(lm)
+        model = lm.model
         below = sorted(int(n[4:]) for n in boundary if n.startswith("blk."))
         blocks = [_unit_rms(boundary[f"blk.{i}"]) for i in below]
-        visits = lm.model.visit_caches(cache)[k:]
-        h, _ = _run_layers(boundary["h"], blocks, layers[k:], visits, k, capture)
-        end = len(layers)
+        visits = model.visit_caches(cache)
+        h = boundary["h"]
+        core = getattr(model, "_core_start", None)
+        if core is None:
+            h, _ = _run_layers(h, blocks, _layers(lm)[k:], visits[k:], k, capture)
+        else:
+            h, blocks = _run_visits(model, h, blocks, boundary, below, visits, k, capture)
+        end = model.num_visits
         if capture is not None and end in capture.layers:
             # The last draft tap is the final-norm output, of the kept rows
             # only: the mix and the norm work row by row.
             rows = slice(capture.start, None)
             sources = [b[:, rows] for b in blocks]
-            x = lm.model.final_input(sources, _unit_rms(h[:, rows]))[:, :, 0]
-            capture.out[end] = lm.model.norm(x).astype(h.dtype)
+            x = model.final_input(sources, _unit_rms(h[:, rows]))[:, :, 0]
+            capture.out[end] = model.norm(x).astype(h.dtype)
         return None
 
     def apply_state(self, cache: list, k: int, state: Arrays) -> None:
