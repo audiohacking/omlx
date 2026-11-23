@@ -113,6 +113,10 @@ CONFIGS = {
         "model_type": "inkling2",
         "text_config": asdict(lm.args.text),
     },
+    "inkling2_loop": lambda lm: {
+        "model_type": "inkling2_loop",
+        "text_config": asdict(lm.args.text),
+    },
 }
 # family -> other files of the checkpoint folder a helper reads (name -> text).
 SIDECARS = {

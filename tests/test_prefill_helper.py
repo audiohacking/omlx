@@ -2048,13 +2048,14 @@ def _inkling2():
     return lm
 
 
-def _inkling2_contract():
+def _inkling2_contract(formats=("nvfp4",) * 6 + ("mxfp8",) * 2, **dims):
     """Eight narrower layers (the helper takes NVFP4 0-5 and MXFP8 6) with
     norm gains near one and NVFP4 block scales and tensor amax of the size the
     checkpoint ships. 32 experts take the router kernel; MLX CUDA's NVFP4
     matmul is exact from 64 inputs per row on."""
     lm = _inkling2_tiny(
-        formats=("nvfp4",) * 6 + ("mxfp8",) * 2,
+        formats=formats,
+        **dims,
         hidden_size=64,
         head_dim=16,
         swa_head_dim=16,
@@ -2078,6 +2079,15 @@ def _inkling2_contract():
     lm.update(tree_unflatten(gains))
     mx.eval(lm.parameters())
     return lm
+
+
+def _inkling2_loop_contract():
+    """The contract stack looped: prelude 0-5, core 6-11 run three times,
+    tail 12-17, NVFP4 experts in 0-11 and MXFP8 in 12-17."""
+    return _inkling2_contract(
+        formats=("nvfp4",) * 12 + ("mxfp8",) * 6,
+        loop_config={"core_start": 6, "core_end": 12, "num_passes": 3, "gate_rank": 4},
+    )
 
 
 def _inkling2_state(cache):
@@ -2314,6 +2324,8 @@ _CONTRACT_CASES = {
     "glm5_next": (GLM, _glm_contract, 3, "language_model."),
     "deepseek_v41": (DSV41, _dsv41_contract, 6, "language_model."),
     "inkling2": (INKLING2, _inkling2_contract, 7, ""),
+    # The helper's share ends inside the first core pass.
+    "inkling2_loop": (INKLING2, _inkling2_loop_contract, 9, ""),
 }
 
 
