@@ -44,7 +44,7 @@ from omlx.prefill_helper import agent, launcher, lending, wire
 from omlx.prefill_helper import manager as manager_module
 from omlx.prefill_helper import routes as helper_routes
 from omlx.prefill_helper import worker as worker_module
-from omlx.prefill_helper.adapter import Capture
+from omlx.prefill_helper.adapter import Capture, StageAdapter
 from omlx.prefill_helper.adapters import adapter_for, adapter_for_model
 from omlx.prefill_helper.client import HelperClient, HelperError
 from omlx.prefill_helper.launcher import HelperTarget
@@ -2470,3 +2470,20 @@ def test_qwen35_helper_refuses_a_checkpoint_it_cannot_load(tmp_path, monkeypatch
     (tmp_path / "config.json").write_text(json.dumps(config))
     with pytest.raises(ValueError, match="own loader"):
         QWEN35.load_first(str(tmp_path), 1)
+
+
+def test_inkling2_loop_plans_visits(tmp_path):
+    lm = _inkling2_loop()
+    weights = dict(tree_flatten(lm.parameters()))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    config = {"model_type": "inkling2_loop", "text_config": {
+        "num_hidden_layers": 18,
+        "loop_config": {"core_start": 6, "core_end": 12, "num_passes": 3},
+    }}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    _, layers = StageAdapter.memory_plan(INKLING2, tmp_path)
+    _, visits = INKLING2.memory_plan(tmp_path)
+    # A layer's bytes count at its first visit; the later passes add none.
+    assert len(visits) == 30 and visits[:12] == layers[:12]
+    assert visits[12:24] == [0] * 12 and visits[24:] == layers[12:]
+    assert INKLING2.split_limit(len(visits), tmp_path) == 24

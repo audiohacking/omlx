@@ -68,6 +68,22 @@ def _loop_end(model_path: str | Path | None) -> int | None:
     return start + int(loop.get("num_passes", 1)) * (end - start)
 
 
+def _schedule(model_path: str | Path) -> list[int] | None:
+    """The layer of every visit of a looped checkpoint, or None."""
+    try:
+        config = json.loads((Path(model_path).expanduser() / "config.json").read_text())
+    except (OSError, ValueError):
+        return None
+    text = config.get("text_config") or config
+    loop = text.get("loop_config")
+    if not loop:
+        return None
+    start, end = int(loop["core_start"]), int(loop["core_end"])
+    count = int(text["num_hidden_layers"])
+    core = list(range(start, end)) * int(loop.get("num_passes", 1))
+    return list(range(start)) + core + list(range(end, count))
+
+
 def _held_layers(model: Any, k: int) -> int:
     """Layers the first ``k`` visits run: the first ``n`` of them."""
     if getattr(model, "_core_start", None) is None:
@@ -258,6 +274,25 @@ class Inkling2Adapter(StageAdapter):
         # A looped model's helper may run visits up to the tail.
         end = _loop_end(model_path)
         return n_layers - 1 if end is None else min(n_layers - 1, end)
+
+    def memory_plan(self, model_path: str | Path) -> tuple[int, list[int]]:
+        # A looped checkpoint's split counts visits: a layer's bytes count at
+        # its first visit, a later one adds none.
+        shared, per_layer = super().memory_plan(model_path)
+        visits = _schedule(model_path)
+        if visits is None:
+            return shared, per_layer
+        seen: set[int] = set()
+        plan = []
+        for layer in visits:
+            plan.append(0 if layer in seen else per_layer[layer])
+            seen.add(layer)
+        return shared, plan
+
+    def weight_files(self, model_path: str | Path, k: int) -> set[str]:
+        visits = _schedule(model_path)
+        held = k if visits is None else max(visits[:k], default=-1) + 1
+        return super().weight_files(model_path, held)
 
     def resident(self, tensor: str) -> bool:
         # The embedding and the layers; the head, the final mix and norm,
