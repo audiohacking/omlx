@@ -2129,20 +2129,27 @@ def _inkling2_loop():
 
 
 @pytest.mark.parametrize(
-    "k,prefix", [(1, 0), (5, 0), (6, 0), (7, 0), (11, 0), (12, 0), (7, 1), (12, 1)]
+    "k,prefix",
+    [
+        (1, 0), (5, 0), (6, 0), (7, 0), (11, 0), (12, 0), (7, 1), (12, 1),
+        (13, 0), (15, 0), (17, 0), (18, 0), (19, 0), (23, 0), (24, 0),
+        (15, 1), (21, 1),
+    ],
 )
 def test_inkling2_loop_split_matches_whole_model(k, prefix):
-    # Cuts in the prelude, at the core, inside and at the end of the first
-    # pass: this Mac runs the later passes and the tail from the cut.
+    # Cuts in the prelude, at the core, inside and at the end of each core
+    # pass, and at the tail: the helper's share rebuilds the prelude and the
+    # message bank on this Mac, which runs the rest of the loop and the tail.
     ids = mx.array(np.random.default_rng(5).integers(3, 58, (1, 30)))
     _split_matches(INKLING2, _inkling2_loop, ids, [12, 10, 8], k, prefix, _inkling2_state)
 
 
-def test_inkling2_loop_split_limit_ends_the_first_pass(tmp_path):
+def test_inkling2_loop_split_limit_ends_the_last_pass(tmp_path):
     config = {"model_type": "inkling2_loop", "text_config": {"loop_config": {
         "core_start": 6, "core_end": 18, "num_passes": 3}}}
     (tmp_path / "config.json").write_text(json.dumps(config))
-    assert INKLING2.split_limit(24, tmp_path) == 18
+    assert INKLING2.split_limit(48, tmp_path) == 42
+    assert INKLING2.split_limit(30, tmp_path) == 29
     assert INKLING2.split_limit(24) == 23
     assert INKLING2.layer_count(_inkling2_loop()) == 30
 
@@ -2342,7 +2349,7 @@ _CONTRACT_CASES = {
     "deepseek_v41": (DSV41, _dsv41_contract, 6, "language_model."),
     "inkling2": (INKLING2, _inkling2_contract, 7, ""),
     # The helper's share ends inside the first core pass.
-    "inkling2_loop": (INKLING2, _inkling2_loop_contract, 9, ""),
+    "inkling2_loop": (INKLING2, _inkling2_loop_contract, 21, ""),
 }
 
 

@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inkling 2 Mini stages (inkling2_loop) must reproduce the oMLX contract fixture.
 
-A helper takes layer visits up to the end of the first core pass, where visit
-``i`` is layer ``i``; the host runs the later passes.
+A helper takes layer visits up to the tail, holding the prelude and core
+layers once; the fixture's cut is inside the third core pass, so a stage
+rebuilds the prelude and each pass's message bank as the host does.
 """
 
 from __future__ import annotations
@@ -81,9 +82,7 @@ def _assert_matches(got, want, meta, tag):
 
 
 @pytest.mark.parametrize(
-    "bounds",
-    [(0, 9), (0, 6, 9), (0, 7, 9), (0, 3, 6, 9), (0, 12)],
-    ids=["one-stage", "cut-at-core", "cut-in-core", "cuts-3-6", "holds-the-pass"],
+    "bounds", [(0, 21), (0, 24)], ids=["one-stage", "holds-every-pass"]
 )
 def test_stages_reproduce_the_contract_fixture(bounds):
     meta, arrays = _case()
@@ -92,12 +91,20 @@ def test_stages_reproduce_the_contract_fixture(bounds):
         _assert_matches(state, _group(arrays, f"s{index}:"), meta, f"s{index}:")
 
 
-def test_a_stage_ends_by_the_end_of_the_first_core_pass():
-    with pytest.raises(ValueError, match="first core pass"):
-        load_stage(FIXTURE / "model", 0, 13)
+def test_a_stage_ends_by_the_tail():
+    with pytest.raises(ValueError, match="last core pass"):
+        load_stage(FIXTURE / "model", 0, 25)
 
 
-def test_the_plan_leaves_out_the_loop_controllers():
-    assert not family.resident("model.layers.7.loop_down")
-    assert not family.resident("model.layers.7.loop_message.query")
-    assert family.resident("model.layers.7.mlp_norm.weight")
+def test_a_stage_past_the_first_pass_starts_at_visit_0():
+    with pytest.raises(ValueError, match="starts at visit 0"):
+        load_stage(FIXTURE / "model", 6, 13)
+
+
+def test_a_stage_holds_each_layer_once():
+    stage = load_stage(FIXTURE / "model", 0, 24)
+    assert [layer.index for layer in stage.layers] == list(range(12))
+    assert family.resident("model.layers.7.loop_down")
+    assert family.resident("model.layers.7.loop_message.query")
+    shared, visits = family.plan(FIXTURE / "model")
+    assert len(visits) == 30 and visits[6] > 0 and visits[12:24] == [0] * 12

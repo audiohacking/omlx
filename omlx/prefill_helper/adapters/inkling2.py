@@ -10,11 +10,15 @@ a sliding layer keeps only the rows its window can still reach.
 
 A looped checkpoint (inkling2_loop) runs its core layers several times per
 token, and every visit owns a cache entry, so the split counts visits. The
-helper takes visits up to the end of the first core pass, which reads no
-messages: up to there visit ``i`` is layer ``i``, and the cut carries what
-a plain one does. This Mac continues the loop from the cut: the later passes
-restart from the partial sum entering the core, which the cut already sends
-as ``blk.<core_start>``.
+helper may take visits up to the tail: its layers are then the prelude and
+the core, each held once. Every later core pass restarts from the partial
+sum entering the core and reads the pass before through its message bank:
+the blocks that pass completed and the partial sum it ended on. So a cut
+sends ``blk.<visit>`` for each boundary visit before it (a later pass's
+first visit takes the prelude's sum, already sent as ``blk.<core_start>``)
+and ``end.<visit>``, the partial sum entering each later pass's first visit
+before it restarts; this Mac replays the schedule up to the cut to rebuild
+the prelude, the bank and the pass's blocks, then continues the loop.
 """
 
 from __future__ import annotations
@@ -49,7 +53,8 @@ def _layers(lm: Any) -> list:
 
 
 def _loop_end(model_path: str | Path | None) -> int | None:
-    """The visit that ends a looped checkpoint's first core pass, or None."""
+    """The first tail visit of a looped checkpoint (the end of its last core
+    pass), or None."""
     if model_path is None:
         return None
     try:
@@ -57,11 +62,21 @@ def _loop_end(model_path: str | Path | None) -> int | None:
     except (OSError, ValueError):
         return None
     loop = (config.get("text_config") or config).get("loop_config")
-    return int(loop["core_end"]) if loop else None
+    if not loop:
+        return None
+    start, end = int(loop["core_start"]), int(loop["core_end"])
+    return start + int(loop.get("num_passes", 1)) * (end - start)
+
+
+def _held_layers(model: Any, k: int) -> int:
+    """Layers the first ``k`` visits run: the first ``n`` of them."""
+    if getattr(model, "_core_start", None) is None:
+        return k
+    return max((idx for idx, _ in model._schedule[:k]), default=-1) + 1
 
 
 def _keep_visits(model: Any, k: int) -> None:
-    """A looped model that keeps only its first ``k`` layers runs them once."""
+    """A looped model that keeps only its first ``k`` visits runs those."""
     if getattr(model, "_core_start", None) is not None:
         model._schedule = tuple(model._schedule[:k])
 
@@ -113,28 +128,75 @@ def _run_layers(
     return h, entered
 
 
+def _replay(model: Any, boundary: Arrays, k: int) -> tuple:
+    """The prelude, message bank and blocks a looped model holds entering
+    visit ``k``, from a cut's ``blk.*`` and ``end.*`` sums."""
+    core = model._core_start
+    blocks: list = []
+    prelude = bank = None
+    for visit in range(k):
+        idx, loop_pass = model._schedule[visit]
+        if idx == core and prelude is None:
+            prelude = (boundary[f"blk.{visit}"], list(blocks))
+        elif idx == core:
+            ended = boundary[f"end.{visit}"]
+            bank = (
+                blocks[len(prelude[1]) + 1 :],
+                inkling2._unit_rms(ended.astype(mx.float32)),
+            )
+            blocks = list(prelude[1])
+        if model.layers[idx].is_boundary:
+            entered = prelude[0] if idx == core and loop_pass else boundary[f"blk.{visit}"]
+            blocks.append(_unit_rms(entered))
+    return prelude, bank, blocks
+
+
+def _first_visits(
+    model: Any, h: mx.array, visits: list, capture: Capture | None = None
+) -> tuple[mx.array, Arrays]:
+    """A looped model's kept visits on ``h``, as ``Inkling2TextModel`` runs
+    them. Returns the partial sum and the cut's ``blk.*`` and ``end.*``."""
+    core = model._core_start
+    blocks: list = []
+    sent: Arrays = {}
+    prelude = bank = tau = None
+    for visit, (idx, loop_pass) in enumerate(model._schedule):
+        layer, c = model.layers[idx], visits[visit]
+        if idx == core and prelude is None:
+            prelude = (h, list(blocks))
+        elif idx == core:
+            sent[f"end.{visit}"] = h
+            bank = (blocks[len(prelude[1]) + 1 :], inkling2._unit_rms(h.astype(mx.float32)))
+            h, blocks = prelude[0], list(prelude[1])
+        if capture is not None:
+            capture.take(visit, h)
+        if layer.is_boundary and not (idx == core and loop_pass):
+            sent[f"blk.{visit}"] = h
+        if not layer.sliding and tau is None:
+            tau = layer.attn.log_tau(c[0], h.shape[1])
+        h = layer(
+            h,
+            blocks,
+            cache=c,
+            bank=bank if loop_pass else None,
+            tau=None if layer.sliding else tau,
+        )
+    return h, sent
+
+
 def _run_visits(
     model: Any,
     h: mx.array,
-    blocks: list,
     boundary: Arrays,
-    below: list[int],
     visits: list,
     k: int,
     capture: Capture | None = None,
 ) -> tuple[mx.array, list]:
     """A looped model's visits from ``k`` on, as ``Inkling2TextModel`` runs
-    them. A cut inside the first core pass rebuilds the prelude the later
-    passes restart from: the partial sum entering the core and the blocks
-    completed before it."""
+    them, from the state the cut's sums rebuild."""
     core = model._core_start
-    prelude = None
-    if k > core:
-        prelude = (
-            boundary[f"blk.{core}"],
-            [_unit_rms(boundary[f"blk.{i}"]) for i in below if i < core],
-        )
-    bank = tau = None
+    prelude, bank, blocks = _replay(model, boundary, k)
+    tau = None
     for visit in range(k, len(model._schedule)):
         idx, loop_pass = model._schedule[visit]
         layer, c = model.layers[idx], visits[visit]
@@ -193,6 +255,7 @@ class Inkling2Adapter(StageAdapter):
         return lm.model.num_visits
 
     def split_limit(self, n_layers: int, model_path: str | Path | None = None) -> int:
+        # A looped model's helper may run visits up to the tail.
         end = _loop_end(model_path)
         return n_layers - 1 if end is None else min(n_layers - 1, end)
 
@@ -202,7 +265,7 @@ class Inkling2Adapter(StageAdapter):
         return _owner(tensor) is not False
 
     def keep_first(self, lm: Any, k: int) -> None:
-        lm.model.layers = _layers(lm)[:k]
+        lm.model.layers = _layers(lm)[: _held_layers(lm.model, k)]
         _keep_visits(lm.model, k)
         for name in ("lm_head", "vision_tower"):
             if name in lm:
@@ -214,7 +277,7 @@ class Inkling2Adapter(StageAdapter):
     @contextmanager
     def use_first(self, lm: Any, k: int):
         layers, schedule = _layers(lm), getattr(lm.model, "_schedule", None)
-        lm.model.layers = layers[:k]
+        lm.model.layers = layers[: _held_layers(lm.model, k)]
         _keep_visits(lm.model, k)
         try:
             yield
@@ -227,9 +290,12 @@ class Inkling2Adapter(StageAdapter):
         maybe_apply_pre_load_patches(path, None, for_vlm=True)
         adapter, loaded = self, set()
 
+        layers_held = [k]
+
         class First(inkling2.Model):
             def __init__(self, args: inkling2.ModelArgs):
                 super().__init__(args)
+                layers_held[0] = _held_layers(self.model, k)
                 adapter.keep_first(self, k)
 
             def sanitize(self, weights: dict) -> dict:
@@ -237,7 +303,7 @@ class Inkling2Adapter(StageAdapter):
                 held = {}
                 for name, value in weights.items():
                     layer = _owner(name)
-                    if layer is None or (layer is not False and layer < k):
+                    if layer is None or (layer is not False and layer < layers_held[0]):
                         held[name] = value
                 out = super().sanitize(held)
                 loaded.update(out)
@@ -269,8 +335,12 @@ class Inkling2Adapter(StageAdapter):
     ) -> tuple[Arrays, Arrays]:
         visits = lm.model.visit_caches(cache)
         h = lm.model.embed_norm(lm.model.embed(tokens))
-        h, entered = _run_layers(h, [], _layers(lm), visits, capture=capture)
-        boundary = {"h": h, **{f"blk.{i}": v for i, v in entered.items()}}
+        if getattr(lm.model, "_core_start", None) is None:
+            h, entered = _run_layers(h, [], _layers(lm), visits, capture=capture)
+            boundary = {"h": h, **{f"blk.{i}": v for i, v in entered.items()}}
+        else:
+            h, sent = _first_visits(lm.model, h, visits, capture)
+            boundary = {"h": h, **sent}
         state: Arrays = {}
         for i, visit in enumerate(visits):
             state.update(_cache_state(i, visit, tokens.shape[1]))
@@ -294,15 +364,14 @@ class Inkling2Adapter(StageAdapter):
         **kwargs: Any,
     ) -> Any:
         model = lm.model
-        below = sorted(int(n[4:]) for n in boundary if n.startswith("blk."))
-        blocks = [_unit_rms(boundary[f"blk.{i}"]) for i in below]
         visits = model.visit_caches(cache)
         h = boundary["h"]
-        core = getattr(model, "_core_start", None)
-        if core is None:
+        if getattr(model, "_core_start", None) is None:
+            below = sorted(int(n[4:]) for n in boundary if n.startswith("blk."))
+            blocks = [_unit_rms(boundary[f"blk.{i}"]) for i in below]
             h, _ = _run_layers(h, blocks, _layers(lm)[k:], visits[k:], k, capture)
         else:
-            h, blocks = _run_visits(model, h, blocks, boundary, below, visits, k, capture)
+            h, blocks = _run_visits(model, h, boundary, visits, k, capture)
         end = model.num_visits
         if capture is not None and end in capture.layers:
             # The last draft tap is the final-norm output, of the kept rows

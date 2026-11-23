@@ -138,6 +138,13 @@ def _meta_text(meta: dict) -> str:
     return "{\n" + ",\n".join(lines) + "\n}\n"
 
 
+# Families whose helper reproduces the host only to a looser absolute bound.
+# The loop controllers round to bf16 twice, so inputs a reduction order apart
+# (~5e-7 in every visit's partial sum) can land a bf16 ulp apart: a later
+# pass's state then differs by up to ~2e-4 on values near 1.
+ATOL = {"inkling2_loop": 5e-4}
+
+
 def record(family: str, force: bool) -> None:
     adapter, _, k, prefix = cases._CONTRACT_CASES[family]
     folder = cases._CONTRACT_DIR / family
@@ -168,7 +175,7 @@ def record(family: str, force: bool) -> None:
         "prefix_chunks": cases._CONTRACT_PREFIX,
         # Float arrays are compared within this tolerance, the rest exactly.
         "rtol": 1e-4,
-        "atol": 1e-5,
+        "atol": ATOL.get(family, 1e-5),
         "manifest": cases._contract_manifest(arrays),
     }
     meta_path.write_text(_meta_text(meta))
