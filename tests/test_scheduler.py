@@ -7125,6 +7125,62 @@ class TestBatchGeneratorAllTokens:
         assert scheduled == [request]
 
 
+class TestRequestSeedStream:
+    @pytest.mark.parametrize("chunked", [False, True])
+    @pytest.mark.parametrize("seeded_row", ["running", "requeued", "finished"])
+    def test_unseeded_insert_after_seeded_request(
+        self, mock_model, mock_tokenizer, chunked, seeded_row
+    ):
+        helper = TestBatchGeneratorAllTokens()
+
+        def insert_then_draw(scheduler, request):
+            cache = [MagicMock()]
+            helper._queue_request(
+                scheduler,
+                request,
+                prompt_tokens=[11, 12],
+                remaining_tokens=[12],
+                cached_tokens=1,
+                prompt_cache=cache,
+            )
+            if chunked:
+                scheduler.waiting.clear()
+                state = SimpleNamespace(
+                    cache=cache,
+                    last_token=[12],
+                    sampler=MagicMock(),
+                    sm=MagicMock(),
+                    per_row_lps=[],
+                )
+                scheduler._insert_prefilled_request(request, state, [])
+            else:
+                scheduler._schedule_waiting()
+            return mx.random.categorical(mx.zeros((8, 100_000))).tolist()
+
+        def seeded_then_unseeded():
+            scheduler = helper._make_scheduler(mock_model, mock_tokenizer)
+            seeded, unseeded = (
+                Request(f"r{seed}", [11, 12], SamplingParams(max_tokens=4, seed=seed))
+                for seed in (1234, None)
+            )
+            first = insert_then_draw(scheduler, seeded)
+            if seeded_row == "requeued":
+                scheduler.running.clear()
+                seeded.status = RequestStatus.WAITING
+                seeded.requeued_output_tokens = 1
+            elif seeded_row == "finished":
+                scheduler.running.clear()
+                seeded.set_finished(RequestStatus.FINISHED_STOPPED)
+            return first, insert_then_draw(scheduler, unseeded)
+
+        seeded_draws, unseeded_draws = zip(
+            *(seeded_then_unseeded() for _ in range(2)), strict=True
+        )
+
+        assert seeded_draws[0] == seeded_draws[1]
+        assert (unseeded_draws[0] == unseeded_draws[1]) is (seeded_row != "finished")
+
+
 class TestDetectNeedsThinkPrefix:
     """Tests for _detect_needs_think_prefix() method.
 
@@ -8351,6 +8407,36 @@ class TestStopStringOutputBuffer:
             assert not outputs[-1].tool_calls
             assert outputs[-1].output_text == "".join(pieces)
 
+    def test_inkling_malformed_call_reports_tool_call_finish(
+        self, mock_model, monkeypatch
+    ):
+        scheduler = self._setup(mock_model)
+        request = scheduler.running["stop-output"]
+        request.sampling_params.stop = []
+        request.tools = [{"type": "function", "function": {"name": "get"}}]
+        tokenizer = scheduler.tokenizer
+        tokenizer.pieces = {
+            **tokenizer.pieces,
+            100: "<|message_model|><|content_thinking|>Check the value.<|end_message|>",
+            101: "<|message_model|>get<|content_invoke_tool_json|>",
+            102: '{"name":"get","args":{"key":"value",}}<|end_message|>',
+        }
+        scheduler._build_state_machine(request)
+        monkeypatch.setattr(
+            output_parser_module,
+            "create_streaming_detokenizer",
+            lambda tokenizer, model_path: _StopSequenceDetokenizer(tokenizer),
+        )
+        session = output_parser_module.InklingOutputParserSession(tokenizer)
+        scheduler._get_output_parser_session = lambda request_id: session
+        responses = [self._response(token) for token in (100, 101, 102)]
+        responses.append(self._response(tokenizer.eos_token_id, "stop"))
+
+        outputs, _ = scheduler._process_batch_responses(responses)
+
+        assert outputs[-1].finish_reason == "tool_calls"
+        assert outputs[-1].tool_calls is None
+
     def test_partial_stop_prefix_is_flushed_on_eos(self, mock_model):
         scheduler = self._setup(mock_model)
         responses = [
@@ -9088,6 +9174,14 @@ class TestHybridDecodeKvEvalDefault:
 
     def test_arrays_cache_model_defaults_to_256(self, mock_tokenizer):
         stub = type("ArraysCache", (), {})()
+        model = self._model_with_cache([stub])
+        scheduler = Scheduler(
+            model=model, tokenizer=mock_tokenizer, config=SchedulerConfig()
+        )
+        assert scheduler._decode_eval_kv_cache_interval == 256
+
+    def test_pooling_cache_model_defaults_to_256(self, mock_tokenizer):
+        stub = type("PoolingCache", (), {})()
         model = self._model_with_cache([stub])
         scheduler = Scheduler(
             model=model, tokenizer=mock_tokenizer, config=SchedulerConfig()

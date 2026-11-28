@@ -486,7 +486,18 @@ class Attention(nn.Module):
         grouped = rope(
             out, rope_positions, c, bool(ratio), inverse=True, quantize=True, heads_major=heads_major
         ).reshape(1, length, c.o_groups, -1)
-        weight = self.wo_a.weight.reshape(c.o_groups, c.o_lora_rank, -1)
+        weight = self.wo_a.weight
+        if isinstance(self.wo_a, nn.QuantizedLinear):
+            weight = mx.dequantize(
+                weight,
+                self.wo_a.scales,
+                None,
+                group_size=self.wo_a.group_size,
+                bits=self.wo_a.bits,
+                mode=self.wo_a.mode,
+                dtype=mx.bfloat16,
+            )
+        weight = weight.reshape(c.o_groups, c.o_lora_rank, -1)
         return self.wo_b(mx.einsum("bsgd,grd->bsgr", grouped, weight).flatten(-2))
 
 
@@ -1706,6 +1717,13 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             # rows rather than re-concatenating every slot of every layer each step.
             item.adopt_rows(rows[i])
             item.advance(input_ids.shape[1])
+        width = max(row.shape[1] for row in results)
+        results = [
+            row
+            if row.shape[1] == width
+            else mx.pad(row, [(0, 0), (width - row.shape[1], 0), (0, 0)])
+            for row in results
+        ]
         logits = mx.concatenate(results, 0)
         if capture:
             if skip_decoder:

@@ -8,6 +8,7 @@ import logging
 import mlx.core as mx
 
 from ...custom_kernels.nax import is_nax_available
+from ...utils import nax_attention
 from ..qwen35_verify_qmm import is_row_exact_armed
 from . import verify_attention
 
@@ -849,6 +850,9 @@ _FLASH_SOURCE = """
     constexpr int BK = 16;
     constexpr int NT = 128;
     constexpr float LOG2E = 1.4426950408889634f;
+    // The fixed-trip loops over head-dim and key fragments are unrolled in
+    // full: left to the compiler, the simdgroup matrix arrays they index
+    // spill on M1 and the kernel runs 20-25% slower.
     const uint tid = thread_position_in_threadgroup.x;
     const uint sg = tid / 32;
     const uint lane = tid % 32;
@@ -878,6 +882,7 @@ _FLASH_SOURCE = """
     threadgroup half Vs[BK * LDV];
 
     simdgroup_half8x8 Qf[D / 8];
+    #pragma clang loop unroll(full)
     for (int db = 0; db < D / 8; ++db) {
         float2 qv = float2(0.0f);
         if (row_ok) {
@@ -889,6 +894,7 @@ _FLASH_SOURCE = """
         Qf[db].thread_elements()[1] = half(qv.y);
     }
     simdgroup_float8x8 Of[D / 8];
+    #pragma clang loop unroll(full)
     for (int db = 0; db < D / 8; ++db) {
         Of[db] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }
@@ -922,6 +928,7 @@ _FLASH_SOURCE = """
                 threadgroup half* kd = Ks + col * LDK + r;
                 threadgroup half* vd = Vs + r * LDV + col;
                 if (IS_BF16) {
+                    #pragma clang loop unroll(full)
                     for (int j = 0; j < 4; ++j) {
                         kd[(2 * j) * LDK] = half(as_type<float>(kw[j] << 16));
                         kd[(2 * j + 1) * LDK] = half(as_type<float>(kw[j] & 0xFFFF0000u));
@@ -930,6 +937,7 @@ _FLASH_SOURCE = """
                     }
                 } else {
                     // FP16 activations (M1/M2 recast): the words already hold halves.
+                    #pragma clang loop unroll(full)
                     for (int j = 0; j < 4; ++j) {
                         const half2 k2 = as_type<half2>(kw[j]);
                         const half2 v2 = as_type<half2>(vw[j]);
@@ -961,8 +969,10 @@ _FLASH_SOURCE = """
         }
 
         simdgroup_float8x8 Sf[BK / 8];
+        #pragma clang loop unroll(full)
         for (int kb = 0; kb < BK / 8; ++kb) {
             Sf[kb] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            #pragma clang loop unroll(full)
             for (int db = 0; db < D / 8; ++db) {
                 simdgroup_half8x8 Kt;
                 simdgroup_load(Kt, Ks + db * 8 * LDK + kb * 8, LDK);
@@ -971,22 +981,40 @@ _FLASH_SOURCE = """
         }
 
         float rmax = -INFINITY;
-        for (int kb = 0; kb < BK / 8; ++kb) {
-            for (int e = 0; e < 2; ++e) {
-                const int key = k0 + kb * 8 + fn + e;
-                const int d = a_row - key;
-                const bool vis = row_ok && d >= 0 && key >= lp
-                    && (WINDOW == 0 || d < WINDOW);
-                float s = Sf[kb].thread_elements()[e] * qscale;
-                if (vis) {
-                    if (d < R) {
-                        s += float(relp[d]) * LOG2E;
-                    }
-                } else {
-                    s = -INFINITY;
+        // Full-attention tiles that every row sees whole and past the bias
+        // band need neither the mask nor the band: only the scale applies.
+        const bool plain = WINDOW == 0 && q0 + BQ <= L && k0 >= lp
+            && k0 + BK <= S && a_first - (k0 + BK - 1) >= R;
+        if (plain) {
+            #pragma clang loop unroll(full)
+            for (int kb = 0; kb < BK / 8; ++kb) {
+                #pragma clang loop unroll(full)
+                for (int e = 0; e < 2; ++e) {
+                    const float s = Sf[kb].thread_elements()[e] * qscale;
+                    Sf[kb].thread_elements()[e] = s;
+                    rmax = max(rmax, s);
                 }
-                Sf[kb].thread_elements()[e] = s;
-                rmax = max(rmax, s);
+            }
+        } else {
+            #pragma clang loop unroll(full)
+            for (int kb = 0; kb < BK / 8; ++kb) {
+                #pragma clang loop unroll(full)
+                for (int e = 0; e < 2; ++e) {
+                    const int key = k0 + kb * 8 + fn + e;
+                    const int d = a_row - key;
+                    const bool vis = row_ok && d >= 0 && key >= lp
+                        && (WINDOW == 0 || d < WINDOW);
+                    float s = Sf[kb].thread_elements()[e] * qscale;
+                    if (vis) {
+                        if (d < R) {
+                            s += float(relp[d]) * LOG2E;
+                        }
+                    } else {
+                        s = -INFINITY;
+                    }
+                    Sf[kb].thread_elements()[e] = s;
+                    rmax = max(rmax, s);
+                }
             }
         }
         rmax = max(rmax, simd_shuffle_xor(rmax, 1));
@@ -995,7 +1023,9 @@ _FLASH_SOURCE = """
         const float factor = fast::exp2(m - m_new);
         float rsum = 0.0f;
         simdgroup_half8x8 Pf[BK / 8];
+        #pragma clang loop unroll(full)
         for (int kb = 0; kb < BK / 8; ++kb) {
+            #pragma clang loop unroll(full)
             for (int e = 0; e < 2; ++e) {
                 const float p = fast::exp2(Sf[kb].thread_elements()[e] - m_new);
                 Pf[kb].thread_elements()[e] = half(p);
@@ -1006,9 +1036,11 @@ _FLASH_SOURCE = """
         rsum += simd_shuffle_xor(rsum, 8);
         l = l * factor + rsum;
         m = m_new;
+        #pragma clang loop unroll(full)
         for (int db = 0; db < D / 8; ++db) {
             Of[db].thread_elements()[0] *= factor;
             Of[db].thread_elements()[1] *= factor;
+            #pragma clang loop unroll(full)
             for (int kb = 0; kb < BK / 8; ++kb) {
                 simdgroup_half8x8 Vm;
                 simdgroup_load(Vm, Vs + kb * 8 * LDV + db * 8, LDV);
@@ -1020,6 +1052,7 @@ _FLASH_SOURCE = """
     if (row_ok) {
         const float inv = 1.0f / l;
         device T* op = out + ((size_t)(b * L + row) * HQ + h) * D;
+        #pragma clang loop unroll(full)
         for (int db = 0; db < D / 8; ++db) {
             op[db * 8 + fn] = T(Of[db].thread_elements()[0] * inv);
             op[db * 8 + fn + 1] = T(Of[db].thread_elements()[1] * inv);
@@ -1043,6 +1076,7 @@ _DECODE_PART_SOURCE = """
     constexpr int BK = 16;
     constexpr int NT = NSG * 32;
     constexpr float LOG2E = 1.4426950408889634f;
+    // Fixed-trip fragment loops are unrolled in full, as in _FLASH_SOURCE.
     const uint tid = thread_position_in_threadgroup.x;
     const uint sg = tid / 32;
     const uint lane = tid % 32;
@@ -1063,7 +1097,8 @@ _DECODE_PART_SOURCE = """
     const bool row_ok = g < G;
     const int h = hk * G + (row_ok ? g : 0);
     // Index of the query's own key, and the number of keys it sees.
-    const int a = S - L + pos;
+    const int a = (RAGGED ? S - dims[3 + int(threadgroups_per_grid.z) + b] : S)
+        - L + pos;
     int nk = a + 1 - lp;
     if (WINDOW > 0) {
         nk = min(nk, WINDOW);
@@ -1080,6 +1115,7 @@ _DECODE_PART_SOURCE = """
     threadgroup half Vs[BK * LDV];
 
     simdgroup_half8x8 Qf[D / 8];
+    #pragma clang loop unroll(full)
     for (int db = 0; db < D / 8; ++db) {
         float2 qv = float2(0.0f);
         if (row_ok) {
@@ -1091,6 +1127,7 @@ _DECODE_PART_SOURCE = """
         Qf[db].thread_elements()[1] = half(qv.y);
     }
     simdgroup_float8x8 Of[D / 8];
+    #pragma clang loop unroll(full)
     for (int db = 0; db < D / 8; ++db) {
         Of[db] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }
@@ -1122,6 +1159,7 @@ _DECODE_PART_SOURCE = """
                 threadgroup half* kd = Ks + col * LDK + r;
                 threadgroup half* vd = Vs + r * LDV + col;
                 if (IS_BF16) {
+                    #pragma clang loop unroll(full)
                     for (int j = 0; j < 4; ++j) {
                         kd[(2 * j) * LDK] = half(as_type<float>(kw[j] << 16));
                         kd[(2 * j + 1) * LDK] = half(as_type<float>(kw[j] & 0xFFFF0000u));
@@ -1129,6 +1167,7 @@ _DECODE_PART_SOURCE = """
                         vd[2 * j + 1] = half(as_type<float>(vw[j] & 0xFFFF0000u));
                     }
                 } else {
+                    #pragma clang loop unroll(full)
                     for (int j = 0; j < 4; ++j) {
                         const half2 k2 = as_type<half2>(kw[j]);
                         const half2 v2 = as_type<half2>(vw[j]);
@@ -1160,8 +1199,10 @@ _DECODE_PART_SOURCE = """
         }
 
         simdgroup_float8x8 Sf[BK / 8];
+        #pragma clang loop unroll(full)
         for (int kb = 0; kb < BK / 8; ++kb) {
             Sf[kb] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            #pragma clang loop unroll(full)
             for (int db = 0; db < D / 8; ++db) {
                 simdgroup_half8x8 Kt;
                 simdgroup_load(Kt, Ks + db * 8 * LDK + kb * 8, LDK);
@@ -1172,7 +1213,9 @@ _DECODE_PART_SOURCE = """
         // Every tile holds a visible key (d0 < d_end), so rmax is a score.
         float sc[BK / 4];
         float rmax = -FLT_MAX;
+        #pragma clang loop unroll(full)
         for (int kb = 0; kb < BK / 8; ++kb) {
+            #pragma clang loop unroll(full)
             for (int e = 0; e < 2; ++e) {
                 const int d = d0 + kb * 8 + fn + e;
                 float s = Sf[kb].thread_elements()[e] * qscale;
@@ -1192,7 +1235,9 @@ _DECODE_PART_SOURCE = """
         const float factor = first ? 0.0f : precise::exp2(m - m_new);
         float rsum = 0.0f;
         simdgroup_half8x8 Pf[BK / 8];
+        #pragma clang loop unroll(full)
         for (int kb = 0; kb < BK / 8; ++kb) {
+            #pragma clang loop unroll(full)
             for (int e = 0; e < 2; ++e) {
                 const int d = d0 + kb * 8 + fn + e;
                 const float p = d < d_end
@@ -1205,9 +1250,11 @@ _DECODE_PART_SOURCE = """
         rsum += simd_shuffle_xor(rsum, 8);
         l = l * factor + rsum;
         m = m_new;
+        #pragma clang loop unroll(full)
         for (int db = 0; db < D / 8; ++db) {
             Of[db].thread_elements()[0] *= factor;
             Of[db].thread_elements()[1] *= factor;
+            #pragma clang loop unroll(full)
             for (int kb = 0; kb < BK / 8; ++kb) {
                 simdgroup_half8x8 Vm;
                 simdgroup_load(Vm, Vs + kb * 8 * LDV + db * 8, LDV);
@@ -1224,6 +1271,7 @@ _DECODE_PART_SOURCE = """
             part_l[slot] = l;
         }
         device float* op = part_o + slot * D;
+        #pragma clang loop unroll(full)
         for (int db = 0; db < D / 8; ++db) {
             op[db * 8 + fn] = Of[db].thread_elements()[0];
             op[db * 8 + fn + 1] = Of[db].thread_elements()[1];
@@ -1292,6 +1340,12 @@ _DECODE_SLIDING_CHUNK = 128
 _DECODE_STAGERS = 2
 
 
+def flash_decode_ok(q, k) -> bool:
+    """Whether ``banded_sink_attention`` sends a batch to the decode kernel,
+    which reads ragged rows (``tails``) in place."""
+    return q.shape[2] < _FLASH_MIN_QUERIES and _use_flash_decode(q, k)
+
+
 def _use_flash_decode(q, k) -> bool:
     """BF16/FP16 queries on the GPU whose head layout fits the decode kernel."""
     return (
@@ -1305,9 +1359,12 @@ def _use_flash_decode(q, k) -> bool:
     )
 
 
-def gqa_flash_decode_attention(q, k, v, rel, sink, *, scale, window, left_padding=None):
+def gqa_flash_decode_attention(
+    q, k, v, rel, sink, *, scale, window, left_padding=None, tails=None
+):
     """``banded_sink_attention`` for batched or left-padded decode-sized
-    BF16/FP16 query blocks. Each row has the bits of the same row run alone."""
+    BF16/FP16 query blocks. Each row has the bits of the same row run alone.
+    ``tails[b]``: keys row ``b`` ends before the last."""
     global _decode_kernels
     b, hq, length, d = q.shape
     hkv, s = k.shape[1], k.shape[2]
@@ -1337,6 +1394,8 @@ def gqa_flash_decode_attention(q, k, v, rel, sink, *, scale, window, left_paddin
     dims = mx.array([length, s, ns] + [0] * b, dtype=mx.int32)
     if left_padding is not None:
         dims = mx.concatenate([dims[:3], left_padding.astype(mx.int32)])
+    if tails is not None:
+        dims = mx.concatenate([dims, mx.array(tails, dtype=mx.int32)])
     part_o, part_m, part_l = part(
         inputs=[
             q,
@@ -1356,6 +1415,7 @@ def gqa_flash_decode_attention(q, k, v, rel, sink, *, scale, window, left_paddin
             ("WINDOW", int(window)),
             ("CHUNK", chunk),
             ("NSG", nsg),
+            ("RAGGED", tails is not None),
         ],
         grid=(ns * nsg * 32, hkv * length, b),
         threadgroup=(nsg * 32, 1, 1),
@@ -1377,12 +1437,6 @@ def gqa_flash_decode_attention(q, k, v, rel, sink, *, scale, window, left_paddin
 
 
 def _use_flash(length: int, window: int) -> bool:
-    """Prefill blocks take the flash kernel on the GPU.
-
-    On hosts with tensor units (NAX) MLX's masked SDPA runs on them, which
-    this kernel does not; there only sliding layers, whose cost is dominated
-    by building the mask, switch to it.
-    """
     if length < _FLASH_MIN_QUERIES or mx.default_device() != mx.gpu:
         return False
     return bool(window) or not is_nax_available()
@@ -1449,24 +1503,30 @@ def banded_sink_attention(
     scale: float,
     window: int = 0,
     left_padding=None,
+    tails=None,
 ) -> mx.array:
     """Attention with a relative bias band and per-query sink logits.
 
     q: [B, Hq, L, D]; k, v: [B, Hkv, S, D] (queries are the last L keys);
     rel: [B, L, Hq, R] bias by backward distance d (applied for d < R);
     sink: [B, L, Hq] logits of a zero-value sink. ``window`` > 0 limits
-    keys to d < window (sliding layers use window == R).
+    keys to d < window (sliding layers use window == R). ``tails``: see
+    ``gqa_flash_decode_attention``.
     """
     b, length = q.shape[0], q.shape[2]
-    if (
-        (b > 1 or left_padding is not None)
-        and length < _FLASH_MIN_QUERIES
-        and _use_flash_decode(q, k)
-    ):
+    if (b > 1 or left_padding is not None) and flash_decode_ok(q, k):
         # Batches, and a row left alone in a batch cache: the kernel reads
         # left_padding itself instead of masking every cached key.
         return gqa_flash_decode_attention(
-            q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
+            q,
+            k,
+            v,
+            rel,
+            sink,
+            scale=scale,
+            window=window,
+            left_padding=left_padding,
+            tails=tails,
         )
     if b == 1 and length == 1 and left_padding is None:
         return _decode_attention(q, k, v, rel, sink, scale, window)
@@ -1494,6 +1554,11 @@ def banded_sink_attention(
             for r in range(length)
         ]
         return mx.concatenate(rows, axis=1).transpose(0, 2, 1, 3)
+    out = nax_attention.nax_banded_sink_attention(
+        q, k, v, rel, sink, scale=scale, left_padding=left_padding, window=window
+    )
+    if out is not None:
+        return out
     if q.dtype in (mx.bfloat16, mx.float16) and _use_flash(length, window):
         return flash_banded_attention(
             q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding

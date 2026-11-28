@@ -94,8 +94,8 @@ def test_decode_batches_take_the_batched_affine_kernels():
     batched_decode_qmm.apply_batched_decode_qmm_patch()
     n = k = 1024
     mx.random.seed(5)
-    m = OqhLinear(k, n, 4, 256)
-    m.weight = mx.random.randint(0, 2**32 - 1, (n, k * 4 // 32)).astype(mx.uint32)
+    m = OqhLinear(k, n, 2, 256)
+    m.weight = mx.random.randint(0, 2**32 - 1, (n, k * 2 // 32)).astype(mx.uint32)
     m.rscale = (mx.random.uniform(shape=(n,)) * 0.02).astype(mx.bfloat16)
     m.oqh_signs = _signs("b", k).reshape(-1, 256).astype(mx.bfloat16)
     x = mx.random.normal((8, 1, k)).astype(mx.bfloat16)
@@ -144,6 +144,20 @@ def test_gather_gemv_rows_match_one_row_decode():
     # One stream verifying three positions.
     verify = m.matmul_rotated(x.reshape(1, 3, 1, 1, 512), idx.reshape(1, 3, 2))
     assert mx.array_equal(verify.reshape(batched.shape), batched)
+
+
+def test_sorted_small_route_sets_use_the_gather_gemv():
+    m = _switch(128, 512, 1024, "s", 1)
+    idx = mx.sort(mx.random.randint(0, 128, (40,))).astype(mx.uint32)
+    x = mx.random.normal((40, 1, 1024)).astype(mx.bfloat16)
+    mx.eval(m.parameters(), idx, x)
+    mx.synchronize()
+    mx.clear_cache()
+    base = mx.get_active_memory()
+    mx.reset_peak_memory()
+    out = m.matmul_rotated(x, idx, sorted_indices=True)
+    mx.eval(out)
+    assert mx.get_peak_memory() - base < 4 * out.nbytes
 
 
 def test_fused_switch_glu_serves_mlx_vlm_and_weighted_sum_callers():

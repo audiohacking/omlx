@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from omlx._version import __version__
-from omlx.cli import _migrate_saved_network_auth
+from omlx.cli import _migrate_saved_network_auth, serve_command
 from omlx.settings import GlobalSettings
 
 
@@ -38,14 +38,16 @@ class TestCLIModule:
         # The module should have the main entry point
         assert callable(cli.main)
 
-    def test_package_import_relaxes_metal_preemption_timeout(self):
-        """Importing omlx sets the Metal driver flag and keeps an explicit value."""
-        code = (
-            "import os, omlx; print(os.environ.get('AGX_RELAX_CDM_CTXSTORE_TIMEOUT'))"
-        )
-        env = {
-            k: v for k, v in os.environ.items() if k != "AGX_RELAX_CDM_CTXSTORE_TIMEOUT"
-        }
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        [
+            ("AGX_RELAX_CDM_CTXSTORE_TIMEOUT", "1"),
+            ("MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS", "1000"),
+        ],
+    )
+    def test_package_import_sets_metal_env_defaults(self, name, value):
+        code = f"import os, omlx; print(os.environ.get({name!r}))"
+        env = {k: v for k, v in os.environ.items() if k != name}
         default = subprocess.run(
             [sys.executable, "-c", code],
             env=env,
@@ -55,12 +57,12 @@ class TestCLIModule:
         )
         explicit = subprocess.run(
             [sys.executable, "-c", code],
-            env={**env, "AGX_RELAX_CDM_CTXSTORE_TIMEOUT": "0"},
+            env={**env, name: "0"},
             capture_output=True,
             text=True,
             timeout=30,
         )
-        expected = "1" if sys.platform == "darwin" else "None"
+        expected = value if sys.platform == "darwin" else "None"
         assert default.stdout.strip() == expected
         assert explicit.stdout.strip() == "0"
 
@@ -1346,6 +1348,45 @@ class TestServeCommandFunctions:
             settings.save_cli_overrides.assert_called_once_with(args)
             settings.save.assert_not_called()
             assert "omlx.server" not in sys.modules
+        finally:
+            listener.close()
+            if previous_server is not None:
+                sys.modules["omlx.server"] = previous_server
+
+    def test_serve_logs_cli_flags_saved_to_settings(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        listener = self._reserve_port()
+        host, port = listener.getsockname()
+        settings = self._make_settings(tmp_path, host=host, port=port)
+        change = "cache.enabled: True -> False"
+        settings.save_cli_overrides = MagicMock(return_value=[change])
+        args = self._make_serve_args(tmp_path, host=host, port=port)
+        previous_server = sys.modules.pop("omlx.server", None)
+
+        def reported():
+            return [
+                record
+                for record in caplog.records
+                if record.name == "omlx.cli" and change in record.getMessage()
+            ]
+
+        reported_before_file_logging = []
+        monkeypatch.setattr("omlx.settings.init_settings", lambda **kwargs: settings)
+        monkeypatch.setattr(
+            "omlx.logging_config.configure_file_logging",
+            lambda **kwargs: reported_before_file_logging.extend(reported()),
+        )
+        monkeypatch.setattr("faulthandler.enable", lambda *args, **kwargs: None)
+        try:
+            with (
+                caplog.at_level("INFO", logger="omlx.cli"),
+                pytest.raises(SystemExit),
+            ):
+                serve_command(args)
+
+            assert reported_before_file_logging == []
+            assert len(reported()) == 1
         finally:
             listener.close()
             if previous_server is not None:

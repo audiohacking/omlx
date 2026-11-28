@@ -75,9 +75,6 @@ from .patches.inkling2.kernels import (
 )
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import _drafter_for as _block_drafter_for
-from .patches.mlx_lm_mtp.batch_generator import (
-    _spec_command_buffers as _decode_command_buffers,
-)
 from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
 from .patches.vlm_batch_kv_capacity import (
     allow_early_kv_growth,
@@ -132,8 +129,16 @@ from .utils.metal_sync import (
     set_chunk_memory_limit,
     unreleased_graphics_bytes,
 )
-from .utils.proc_memory import get_graphics_footprint, get_phys_footprint
-from .utils.sampling import make_no_repeat_ngram_processor, select_logprobs
+from .utils.proc_memory import (
+    get_graphics_footprint,
+    get_graphics_footprint_compressed,
+    get_phys_footprint,
+)
+from .utils.sampling import (
+    make_no_repeat_ngram_processor,
+    seed_request_stream,
+    select_logprobs,
+)
 from .utils.sampling import make_sampler as omlx_make_sampler
 from .utils.sampling import make_shared_sampler as omlx_make_shared_sampler
 from .utils.tokenizer import create_streaming_detokenizer
@@ -919,10 +924,6 @@ def _omlx_advance_grammar_rows(self) -> None:
 
 _original_generation_batch_step = GenerationBatch._step
 
-# Decode of small-active MoE models is bound by command-buffer commits. Dense
-# decode keeps MLX's caps because larger buffers slow it on M5.
-_DECODE_CAPS_TYPES = frozenset({"qwen3_5_moe", "qwen3_6_moe"})
-
 
 def _patched_generation_batch_step(self):
     # Build per-batch mRoPE deltas from UID mapping before each step.
@@ -945,9 +946,6 @@ def _patched_generation_batch_step(self):
     # is there to guarantee.
     _omlx_advance_grammar_rows(self)
 
-    if getattr(model, "model_type", None) in _DECODE_CAPS_TYPES:
-        with _decode_command_buffers(model):
-            return _original_generation_batch_step(self)
     return _original_generation_batch_step(self)
 
 
@@ -1508,6 +1506,20 @@ def _requeue_row_state(request: Any) -> tuple | None:
     return state if isinstance(state, tuple) else None
 
 
+def _start_request_stream(request: Request, requests: dict[str, Request]) -> None:
+    if _request_count(request, "requeued_output_tokens"):
+        return
+    seed = request.sampling_params.seed
+    if seed is None and any(
+        row.sampling_params.seed is not None
+        and row.generation_started_at is not None
+        and not row.is_finished()
+        for row in requests.values()
+    ):
+        return
+    seed_request_stream(seed)
+
+
 def _insert_max_tokens(request: Any) -> int:
     folded = _request_count(request, "requeued_output_tokens")
     return max(1, request.sampling_params.max_tokens - folded)
@@ -1861,6 +1873,21 @@ _CONTENDED_CHUNK_GRID = 64
 _DECODE_ACTIVITY_TTL_S = 2.5
 # Most requests whose resumable prefill chunks share one forward.
 _PACKED_PREFILL_MAX_ROWS = 4
+_POOL_RELEASE_WAIT_S = 2.0
+_POOL_RELEASE_POLL_S = 0.01
+_POOL_RELEASE_SLACK_BYTES = 256 * 1024**2
+
+
+def _graphics_residual() -> int | None:
+    graphics = get_graphics_footprint()
+    if graphics <= 0:
+        return None
+    return (
+        graphics
+        + get_graphics_footprint_compressed()
+        - mx.get_active_memory()
+        - mx.get_cache_memory()
+    )
 
 
 def _decode_share_for_floor(row_decode_tps: float | None) -> float:
@@ -2551,6 +2578,7 @@ class Scheduler:
         )
         # (pool bytes, tokens) left by the last prefill chunk until a clear.
         self._prefill_chunk_pool: tuple[int, int] | None = None
+        self._pool_release: tuple[float, int] | None = None
         # One-shot probe of the GDN/Mamba fixed recurrent-state footprint,
         # armed by _set_model_info_for_monitor when ArraysCache layers exist
         # and taken after the first prefill chunk's eval.
@@ -2585,7 +2613,9 @@ class Scheduler:
         model_name_lower = (self.config.model_name or "").lower()
         self._decode_eval_kv_cache_interval: int = (
             256
-            if "minimax" in model_name_lower or self._model_has_arrays_cache()
+            if "minimax" in model_name_lower
+            or self._model_has_arrays_cache()
+            or self._detect_pooling_cache()
             else 0
         )
         self._tokens_since_kv_cache_eval: int = 0
@@ -5366,7 +5396,7 @@ class Scheduler:
             return n_tokens
 
         # Predicted to breach — reclaim transients and re-measure once.
-        current = self._reclaim_prefill_headroom()
+        current = Scheduler._reclaim_settled_headroom(self)
         if self._prefill_speed_priority:
             # Allow smaller chunks when the full chunk exceeds the safety cap.
             min_chunk = max(1, self._prefill_min_chunk_tokens, minimum_tokens)
@@ -6238,8 +6268,11 @@ class Scheduler:
         )
         # The pool size is exact at clear time. The kernel footprint lags the
         # release, so a footprint delta read here can miss the whole pool.
-        pooled = int(mx.get_cache_memory()) if track else 0
+        pooled = int(mx.get_cache_memory())
+        residual = _graphics_residual() if pooled > 0 else None
         _sync_and_clear_cache(self._stream)
+        if residual is not None:
+            Scheduler._note_pool_release(self, residual)
         self._prefill_chunk_pool = None
         if track:
             tracker.record_flat_reclaim(max(0, pooled))
@@ -6360,7 +6393,7 @@ class Scheduler:
         repay reallocation charges. Partial speed-priority chunks do not
         replace representative overhead or full-step measurements.
         """
-        delta = post_bytes - pre_bytes
+        delta = post_bytes - pre_bytes - unowned_pool_bytes
         monitor = getattr(self, "memory_monitor", None)
         if (
             MemoryMonitor is not None
@@ -6404,8 +6437,6 @@ class Scheduler:
                 / 1024**2,
             )
             return
-        # Pool this chunk did not fill is fixed, not per-token work.
-        delta -= unowned_pool_bytes
         # The reclaim ledger sees every measurement, including samples the
         # EWMA gates below skip: a release on a sub-floor tail must still be
         # priced, and any positive growth confirms the pool reallocation and
@@ -6580,6 +6611,35 @@ class Scheduler:
         """
         Scheduler._clear_cache(self)
         return self._current_usage_bytes()
+
+    def _reclaim_settled_headroom(self) -> int:
+        current = self._reclaim_prefill_headroom()
+        if Scheduler._await_pool_release(self):
+            current = self._current_usage_bytes()
+        return current
+
+    def _note_pool_release(self, residual: int) -> None:
+        if Scheduler._pool_release_pending(self, residual):
+            return
+        self._pool_release = (time.monotonic(), residual)
+
+    def _pool_release_pending(self, residual: int) -> bool:
+        if self._pool_release is None:
+            return False
+        cleared_at, settled = self._pool_release
+        return (
+            time.monotonic() - cleared_at < _POOL_RELEASE_WAIT_S
+            and residual > settled + _POOL_RELEASE_SLACK_BYTES
+        )
+
+    def _await_pool_release(self) -> bool:
+        waited = False
+        residual = _graphics_residual()
+        while residual is not None and Scheduler._pool_release_pending(self, residual):
+            waited = True
+            time.sleep(_POOL_RELEASE_POLL_S)
+            residual = _graphics_residual()
+        return waited
 
     def _check_post_prefill_memory(
         self,
@@ -7759,11 +7819,7 @@ class Scheduler:
 
         Precondition: state.sampler, state.sm, state.per_row_lps are set.
         """
-        # A requeued row keeps the random stream it was already sampling from.
-        if request.sampling_params.seed is not None and not _request_count(
-            request, "requeued_output_tokens"
-        ):
-            mx.random.seed(request.sampling_params.seed)
+        _start_request_stream(request, self.requests)
 
         # #2219: both chunked-completion paths (inline first chunk and
         # _advance_chunked_prefills) funnel through here, but external VLM MTP
@@ -11380,6 +11436,12 @@ class Scheduler:
                         block_table,
                         promote_to_hot_cache=not bypass_hot_cache,
                     )
+                    if reconstructed is None and self._gdn_split_active():
+                        retry = self._restore_shared_system_prefix(
+                            request, original_tokens, bypass_hot_cache
+                        )
+                        if retry is not None:
+                            block_table, reconstructed = retry
                 reconstruct_ms = (time.perf_counter() - reconstruct_started) * 1000.0
                 if block_table.num_tokens < minimum_prefix:
                     reconstructed = None
@@ -11543,6 +11605,41 @@ class Scheduler:
                 0, request.cached_tokens - request.requeue_reported_cached_tokens
             )
         self._prefix_cache_prepared.add(request.request_id)
+
+    def _restore_shared_system_prefix(
+        self,
+        request: Request,
+        matched_tokens: int,
+        bypass_hot_cache: bool,
+    ) -> tuple[Any, list[Any]] | None:
+        system_end = request.system_prefix_end
+        if not 0 < system_end < matched_tokens:
+            return None
+        self.paged_cache_manager.delete_block_table(request.request_id)
+        block_table, _ = self.block_aware_cache.fetch_cache(
+            request.request_id,
+            request.prompt_token_ids[:system_end],
+            extra_keys=request.vlm_extra_keys_for_cache,
+            extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
+            extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+            record_stats=False,
+        )
+        if block_table is None:
+            return None
+        reconstructed = self.block_aware_cache.reconstruct_cache(
+            block_table,
+            promote_to_hot_cache=not bypass_hot_cache,
+        )
+        if reconstructed is None:
+            return None
+        logger.info(
+            "Split GDN restore for %s: no recurrent checkpoint on the %d-token "
+            "match; restored the shared system prefix (%d tokens) instead",
+            request.request_id,
+            matched_tokens,
+            block_table.num_tokens,
+        )
+        return block_table, reconstructed
 
     def _record_prefix_cache_result(self, request: Request) -> None:
         """Finalize ordinary prefix metrics after scheduling's fallback guards."""
@@ -14269,13 +14366,7 @@ class Scheduler:
             # Build per-request state machine for stop tokens
             sm = self._stop_sequences_for_insert(request)
 
-            # Set random seed for reproducible generation (best-effort).
-            # This affects global MLX random state, so concurrent requests
-            # may interfere. Matches OpenAI's best-effort seed semantics.
-            if request.sampling_params.seed is not None and not _request_count(
-                request, "requeued_output_tokens"
-            ):
-                mx.random.seed(request.sampling_params.seed)
+            _start_request_stream(request, self.requests)
 
             # TurboQuant KV is quantized at the end of _do_external_prefill
             # (fp16 prefill → quantize once); _merge_caches() turns the per
@@ -14625,6 +14716,13 @@ class Scheduler:
                         output.tool_calls = final_result.tool_calls
                     if final_result.finish_reason:
                         output.finish_reason = final_result.finish_reason
+                    elif (
+                        final_result.tool_call_failed
+                        and is_stop
+                        and stop_prefix_chars is None
+                        and request.tools
+                    ):
+                        output.finish_reason = "tool_calls"
                     output.output_text = request.output_text
                 else:
                     # Standard finalization without a protocol parser
